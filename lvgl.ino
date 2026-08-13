@@ -1,128 +1,49 @@
-#include <Wire.h>
-#include <SPI.h>
-#include <TFT_eSPI.h>
 #include <lvgl.h>
 #include "ui.h"
 #include "touch_driver.h"
-// LCDWIKI ES3C28P - ESP32-S3 2.8" (ILI9341V + FT6336G)
+#include "display_manager.h"
 
-#define LANDSCAPE 0
-
-#if LANDSCAPE == 1
-#define SCREEN_WIDTH 320
-#define SCREEN_HEIGHT 240
-#else
-#define SCREEN_WIDTH 240
-#define SCREEN_HEIGHT 320
-#endif
-#define BUFFER_LINES 40
-
-TFT_eSPI tft = TFT_eSPI();
-
-lv_display_t *disp = nullptr;
-lv_indev_t *indev = nullptr;
-lv_color_t *disp_buf = nullptr;
 unsigned long last_tick = 0;
+static lv_chart_series_t* ser = NULL;
 
-void flush_cb(lv_display_t *display, const lv_area_t *area, uint8_t *px_map) {
-  uint32_t w = (uint32_t)(area->x2 - area->x1 + 1);
-  uint32_t h = (uint32_t)(area->y2 - area->y1 + 1);
+// Task ile loop arasında paylaşılacak veri
+static volatile int chart_value = 0;
+static volatile bool chart_ready = false;
 
-  // RGB565 byte swap
-  uint16_t *buf = (uint16_t *)px_map;
-  uint32_t pixels = w * h;
+#define CHART_STACK_SIZE 4096   // 10KB fazla, 4KB yeterli
 
-  for (uint32_t i = 0; i < pixels; i++) {
-    buf[i] = (buf[i] >> 8) | (buf[i] << 8);
+static StackType_t chartStack[CHART_STACK_SIZE];
+static StaticTask_t chartTaskBuffer;
+
+// Sadece veri üreten task (LVGL çağrısı YOK)
+void chart_task(void* vParam) {
+  while (true) {
+    chart_value = random(0, 100);   // sensörün yerine
+    vTaskDelay(pdMS_TO_TICKS(50));
   }
-
-  tft.pushImage(area->x1, area->y1, w, h, buf);
-  lv_display_flush_ready(display);
 }
 
-bool initDisplay() {
-  tft.begin();
-#if LANDSCAPE == 1
-  tft.setRotation(1);
-#else
-  tft.setRotation(0);
-#endif
-  pinMode(TFT_BL, OUTPUT);
-  digitalWrite(TFT_BL, HIGH);
-
-  tft.fillScreen(TFT_BLACK);
-  delay(100);
-  Serial.printf(
-    "LCD: %dx%d\n",
-    tft.width(),
-    tft.height());
-  Serial.println("LCD hazir.");
-  return true;
-}
-
-bool initLVGLDisplay() {
-  lv_init();
-
-  size_t buffer_pixels = (size_t)SCREEN_WIDTH * BUFFER_LINES;
-  size_t buffer_bytes = buffer_pixels * sizeof(lv_color_t);
-
-  disp_buf = (lv_color_t *)malloc(buffer_bytes);
-
-  if (!disp_buf) {
-    Serial.println("HATA: LVGL buffer ayrilamadi!");
-    return false;
+// Chart ayarlarını setup içinde yap (ui_init sonrası)
+void chart_init() {
+  if (objects.chart == NULL) {
+    Serial.println("HATA: objects.chart bulunamadi!");
+    return;
   }
 
-  disp = lv_display_create(SCREEN_WIDTH, SCREEN_HEIGHT);
+  lv_chart_set_type(objects.chart, LV_CHART_TYPE_LINE);
+  lv_chart_set_point_count(objects.chart, 50);
+  lv_chart_set_range(objects.chart, LV_CHART_AXIS_PRIMARY_Y, 0, 100);
+  lv_chart_set_update_mode(objects.chart, LV_CHART_UPDATE_MODE_SHIFT);
 
-  if (!disp) {
-    Serial.println("HATA: LVGL display olusturulamadi!");
-    free(disp_buf);
-    disp_buf = nullptr;
-    return false;
-  }
+  ser = lv_chart_add_series(objects.chart, lv_color_hex(0x00FF00), LV_CHART_AXIS_PRIMARY_Y);
+  chart_ready = true;
 
-  lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565);
-  lv_display_set_flush_cb(disp, flush_cb);
-  lv_display_set_buffers(
-    disp,
-    disp_buf,
-    NULL,
-    buffer_bytes,
-    LV_DISPLAY_RENDER_MODE_PARTIAL);
-
-  Serial.println("LVGL display hazir.");
-  return true;
-}
-
-bool initLVGLTouch() {
-  //   FT6336G_setRotation(0);
-  FT6336G_setScreenSize(SCREEN_WIDTH, SCREEN_HEIGHT);
-
-  FT6336G_setDebug(true);  // gerekirse ac
-
-  indev = lv_indev_create();
-
-  if (!indev) {
-    Serial.println("HATA: LVGL input device olusturulamadi!");
-    return false;
-  }
-
-  lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
-  lv_indev_set_read_cb(indev, FT6336G_readCallback);
-
-  Serial.println("LVGL touch hazir.");
-  return true;
+  Serial.println("Chart hazir.");
 }
 
 void setup() {
   Serial.begin(115200);
   delay(500);
-
-  Serial.println("\n========================================");
-  Serial.println(" ESP32-S3 LCDWIKI ES3C28P");
-  Serial.println(" ILI9341V + FT6336G + LVGL 9");
-  Serial.println("========================================");
 
   if (!initDisplay()) {
     Serial.println("LCD baslatilamadi!");
@@ -143,10 +64,24 @@ void setup() {
     while (true) delay(1000);
   }
 
-  Serial.println("SquareLine UI baslatiliyor...");
-
+  Serial.println("UI baslatiliyor...");
   ui_init();
   lv_timer_handler();
+
+  // Chart'ı UI hazır olduktan sonra kur
+  chart_init();
+
+  // Task'ı oluştur
+  xTaskCreateStaticPinnedToCore(
+    chart_task,
+    "Chart",
+    CHART_STACK_SIZE,
+    NULL,
+    1,
+    chartStack,
+    &chartTaskBuffer,
+    0
+  );
 
   Serial.println("SISTEM HAZIR");
 }
@@ -159,6 +94,11 @@ void loop() {
     last_tick = now;
   }
 
+  // LVGL güncellemeleri sadece burada (güvenli)
+  if (chart_ready && ser != NULL) {
+    lv_chart_set_next_value(objects.chart, ser, chart_value);
+  }
+
   lv_timer_handler();
-  delay(2);
+  delay(5);
 }
